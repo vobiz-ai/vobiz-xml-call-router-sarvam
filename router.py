@@ -51,7 +51,7 @@ class Config:
     hold_seconds: int = 15
 
     # sim_forward: calls reach Vobiz via a SIM that forwards them, so `From` is
-    #              the SIM, not the citizen. Identity is only knowable if the
+    #              the forwarding line, not the caller. Identity is only knowable if the
     #              carrier emitted a SIP Diversion header (-> ForwardedFrom).
     # direct_did:  callers dial the Vobiz DID directly, so `From` IS the caller.
     inbound_mode: Literal["sim_forward", "direct_did"] = "sim_forward"
@@ -103,7 +103,7 @@ def resolve_identity(params: dict, config: Config) -> Identity:
     """Work out who is calling, and whether we are allowed to believe it.
 
     This is the function that makes the SIM-forwarding problem visible instead
-    of silently routing every citizen as if they were the same person.
+    of silently routing every caller as if they were the same person.
     """
     forwarded = normalise(params.get("ForwardedFrom", ""))
     caller = normalise(params.get("From", ""))
@@ -122,7 +122,7 @@ def resolve_identity(params: dict, config: Config) -> Identity:
         return Identity("", "unknown", False, "From was empty on a direct DID call")
 
     # sim_forward and no Diversion header: From is the forwarding SIM. It is
-    # the same value for every citizen, so it identifies nobody.
+    # the same value for every caller, so it identifies nobody.
     if config.sim_number and caller == normalise(config.sim_number):
         return Identity(
             "", "From", False,

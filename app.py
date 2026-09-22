@@ -94,10 +94,9 @@ AI_MODE = os.getenv("AI_MODE", "stub")
 # proxy mode
 AI_ANSWER_URL = os.getenv("AI_ANSWER_URL", "")
 # Backends commonly select which agent answers from the number the call came
-# in on. Rewriting `To` therefore re-points the call at a different agent —
-# powerful, but if nothing is listening on that identifier the backend may
-# accept the connection and drop it with no error. Off by default: the dialled
-# number is normally already bound to the right agent.
+# in on. Rewriting `To` therefore re-points the call at a different agent.
+# Off by default, because the dialled number normally already selects the
+# right agent, and the rewritten target needs an agent configured against it.
 PROXY_REWRITE_TO = os.getenv("PROXY_REWRITE_TO", "false").lower() == "true"
 
 # stream mode
@@ -361,9 +360,8 @@ def xml_ai(decision, params: dict, request: Request) -> Response:
     base = base_url(request)
 
     if AI_MODE == "stream" and AI_STREAM_URL:
-        # A bare <Hangup/> after <Stream> means any socket failure ends the
-        # call in about a second with nothing to hear. A spoken fallback makes
-        # a backend outage audible instead of looking like a dropped call.
+        # A spoken fallback after <Stream> means a connection problem is
+        # audible to the caller rather than silent.
         return xml(
             f"""    <Stream bidirectional="true"
             keepCallAlive="true"
@@ -402,14 +400,12 @@ def backend_payload(decision, params: dict) -> dict:
     resolved = decision.identity.best()      # keeps the country code
 
     # Backends commonly select the agent from `To`, so rewriting it re-points
-    # a different agent. Default is to pass `To` straight through: the DID the
-    # citizen dialled is already bound to the right agent, and rewriting it to
-    # the call. A number with no live agent behind it makes a backend accept the
-    # websocket and close it immediately, which reads as a dropped call.
+    # the call at a different agent. `To` is passed straight through by
+    # default: the number that was dialled already selects the right agent.
     #
-    # Only set AI_TARGET_* when you specifically want this service to choose a
-    # different agent than the dialled number implies (a repeat-caller agent,
-    # say) — and only to identifiers with a live agent behind them.
+    # Set AI_TARGET_* only when this service should choose a different agent
+    # than the dialled number implies — a returning-caller agent, say — and
+    # only to identifiers that have an agent configured against them.
     agent_number = AI_TARGET_REPEAT if decision.pool == "ai_repeat" else AI_TARGET_NEW
     if PROXY_REWRITE_TO and agent_number and agent_number != params.get("To", ""):
         payload["OriginalTo"] = params.get("To", "")
@@ -445,10 +441,9 @@ def backend_payload(decision, params: dict) -> dict:
 def instrument_stream(backend_xml: str, request: Request) -> str:
     """Add our statusCallbackUrl to a <Stream> that has none.
 
-    A backend's XML often sets no status callback, so the platform posts stream events to the
-    literal string "no-stream-status-callback-url" and they are lost. Adding
-    ours changes nothing about the call and makes stream failures visible here
-    instead of only in the platform's own logs.
+    Stream lifecycle events then reach this service. It changes nothing about
+    the call, and means stream status is visible here rather than only in the
+    platform's own logs.
     """
     try:
         root = ET.fromstring(backend_xml)

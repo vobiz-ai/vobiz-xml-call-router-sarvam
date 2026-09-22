@@ -64,13 +64,13 @@ def reset(wipe_history: bool = False):
                   timeout=5)
 
 
-def answer(uuid: str, citizen: str = "", diversion: bool = True, **extra):
+def answer(uuid: str, caller: str = "", diversion: bool = True, **extra):
     payload = {"CallUUID": uuid, "From": FORWARDER, "To": DIALLED,
                "Direction": "inbound", "CallStatus": "ringing", "Event": "StartApp"}
     # ForwardedFrom is present only when the carrier emitted a SIP Diversion
     # header. It is omitted entirely when absent — never sent empty.
-    if citizen and diversion:
-        payload["ForwardedFrom"] = citizen
+    if caller and diversion:
+        payload["ForwardedFrom"] = caller
     payload.update(extra)
     return requests.post(f"{BASE}/answer", data=payload, timeout=10)
 
@@ -83,9 +83,9 @@ def hangup(uuid: str):
     requests.post(f"{BASE}/hangup", data={"CallUUID": uuid}, timeout=5)
 
 
-def call(citizen: str, diversion: bool = True, uuid: str = "") -> dict:
+def call(caller: str, diversion: bool = True, uuid: str = "") -> dict:
     cuid = uuid or f"sim-{next(COUNTER):04d}"
-    answer(cuid, citizen, diversion)
+    answer(cuid, caller, diversion)
     d = last_decision()
     d["_uuid"] = cuid
     return d

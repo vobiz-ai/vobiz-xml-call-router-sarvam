@@ -159,20 +159,20 @@ like this:
 </Stream><Hangup/>
 ```
 
-Four things worth knowing, all learned the hard way:
+Two configuration points matter:
 
-- **Sarvam picks the agent from `To`.** It derives `agent_phone_number` from
-  the number dialled. So the DID must have a live Sarvam agent bound to it.
-- **Don't rewrite `To` casually.** `PROXY_REWRITE_TO=true` re-points the call at
-  `AI_TARGET_NEW` / `AI_TARGET_REPEAT`, which is how you give returning callers
-  a different agent — but if that number has no live agent, Sarvam accepts the
-  websocket and closes it with **no error**. The call dies in ~1s and looks
-  exactly like a dropped call. Off by default.
-- **`maxRetries="0"` plus a bare `<Hangup/>`** means any socket failure ends the
-  call in about a second with nothing to hear.
-- **Sarvam sets no `statusCallbackUrl`**, so Vobiz posts stream events to the
-  literal string `no-stream-status-callback-url` and gets `400`. The router
-  injects its own, so stream failures land in your log instead of vanishing.
+- **Sarvam selects the agent from `To`.** It derives `agent_phone_number` from
+  the number that was dialled, so the DID needs its Sarvam agent bound to it.
+  This is why the router passes `To` through unchanged by default.
+- **`PROXY_REWRITE_TO`** re-points the call at `AI_TARGET_NEW` /
+  `AI_TARGET_REPEAT`, which is how you give returning callers a different
+  agent. Leave it off unless you want that: the dialled number already selects
+  the right agent, and both target numbers need a Sarvam agent configured
+  against them.
+
+The router adds a `statusCallbackUrl` to the `<Stream>` so stream lifecycle
+events reach your own logs, and places a spoken fallback after it so a
+connection problem is audible to the caller rather than silent.
 
 The router also rewrites `From` to the resolved caller, so **Sarvam needs no
 code change** — it reads `From` as always and now sees the real caller rather
