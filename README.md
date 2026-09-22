@@ -1,9 +1,9 @@
-# Call router
+# Vobiz XML Call Router
 
-A routing layer for programmable voice. It sits on your voice platform's
-**answer URL** and decides, per call, where that call should go — an AI agent,
-a human, a SIP endpoint, a hold queue, or a polite rejection with the caller's
-number captured.
+A routing layer for Vobiz XML — and for the Plivo-compatible dialects it
+shares. It sits on your voice application's **answer URL** and decides, per
+call, where that call should go: an AI agent, a human, a SIP endpoint, a hold
+queue, or a polite rejection with the caller's number captured.
 
 ```
 caller → platform ──answer_url──> router ──┬── <Stream> to an AI backend
@@ -60,7 +60,8 @@ Pointing the answer URL at this service gives you all of that, and it is a
 ## Run it locally
 
 ```bash
-git clone <this repo> && cd call-router
+git clone https://github.com/vobiz-ai/vobiz-xml-call-router.git
+cd vobiz-xml-call-router
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env          # set PUBLIC_URL; everything else has defaults
 ./run.sh                      # listens on :8090
@@ -114,7 +115,7 @@ curl -X POST "https://api.<platform>/api/v1/Account/$AUTH_ID/Application/" \
   -H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
-    "app_name": "Call-Router",
+    "app_name": "XML-Call-Router",
     "answer_url":  "'"$PUBLIC_URL"'/answer",  "answer_method": "POST",
     "hangup_url":  "'"$PUBLIC_URL"'/hangup",  "hangup_method": "POST",
     "fallback_answer_url": "<your current answer URL>",
@@ -487,3 +488,11 @@ of it.
 correct for a single instance — a restart means the calls it was tracking are
 gone too, so persisting them would restore phantom occupancy. For more than one
 instance this becomes Redis; the interface is deliberately three methods wide.
+
+---
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
+
+Copyright (c) 2026 Ilaimitado Private Limited.

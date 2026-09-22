@@ -1,5 +1,5 @@
 """
-app.py — a routing layer for programmable voice
+app.py — Vobiz XML call router
 ================================================
 Sits between a programmable-voice platform and whatever should handle the
 call. The platform posts every inbound call here; this service decides where
@@ -166,7 +166,7 @@ queue_cycles: dict[str, int] = {}
 # caller must not lose their identity just because they were put on hold.
 call_context: dict[str, tuple[Identity, CallerHistory]] = {}
 
-app = FastAPI(title="Call router")
+app = FastAPI(title="Vobiz XML Call Router")
 
 
 # --- Helpers ---------------------------------------------------------------
