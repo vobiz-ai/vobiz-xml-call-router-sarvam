@@ -5,10 +5,13 @@ URL** and decides, per call, where that call goes: a Sarvam AI agent, a human,
 a SIP endpoint, a hold queue, or a rejection with the caller's number captured.
 
 ```
-caller → Vobiz ──answer_url──> router ──┬── <Stream> to Sarvam
-                                        ├── <Dial>   to a human / SIP endpoint
-                                        ├── hold, re-decide when a channel frees
-                                        └── reject unanswered, capture the number
+                                             ┌──────────────────────┐
+                                        ┌───▶│  Sarvam answer URL   │
+┌──────────────┐     ┌──────────────┐   │    └──────────────────────┘
+│ Vobiz number │────▶│ customer XML │───┤
+└──────────────┘     │  (this app)  │   │    ┌──────────────────────┐
+                     └──────────────┘   └───▶│     SIP endpoint     │
+                                             └──────────────────────┘
 ```
 
 **Media never passes through it.** Audio still flows directly between Vobiz and
@@ -26,7 +29,7 @@ git clone https://github.com/vobiz-ai/vobiz-xml-call-router-sarvam.git
 cd vobiz-xml-call-router-sarvam
 python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 cp .env.example .env          # set PUBLIC_URL
-./run.sh                      # :8090, console at http://127.0.0.1:8090/
+python app.py                 # :8090, console at http://127.0.0.1:8090/
 ```
 
 Expose it — Vobiz needs HTTPS:
@@ -39,9 +42,9 @@ cloudflared tunnel --url http://localhost:8090   # put the URL in PUBLIC_URL
 answers with a spoken description of the decision it just made. Prove the
 routing first, wire Sarvam in after.
 
-> Use `./run.sh`, not `python app.py`. It reclaims the port first; otherwise a
-> second `python app.py` fails to bind and leaves the **old** process serving,
-> so your changes appear to do nothing.
+> `app.py` reclaims its own port on startup. Without that, a second start
+> fails to bind, exits, and leaves the **old** process serving — so your
+> changes appear to do nothing.
 
 ---
 
@@ -222,8 +225,8 @@ records which source identified the caller and whether it was trusted. See it
 without dialling:
 
 ```bash
-python sim.py repeat                 # caller recognised
-python sim.py repeat --no-diversion  # same caller, unidentifiable
+python test.py sim repeat                 # caller recognised
+python test.py sim repeat --no-diversion  # same caller, unidentifiable
 ```
 
 Identity is resolved once at `/answer` and cached for the call: it isn't
@@ -266,20 +269,19 @@ and runs what `/transfer-target` returns.
 ## Testing
 
 ```bash
-python verify.py       # 11 assertions across every branch; non-zero on failure
-python sim.py all      # the same paths, narrated
+python test.py verify          # 13 assertions across every branch; non-zero on failure
+python test.py sim all         # the same paths, narrated
+python test.py sim identity    # · fill · repeat · queue
+python test.py mock            # stand in for a backend on :8091, print what it receives
+python test.py call --to +91…  # place a real call through the router
 ```
 
-`sim.py` drives the router with synthetic calls so you can watch decisions
-without dialling: `identity`, `fill`, `repeat`, `queue`. Use small capacities
-(`AI_CAPACITY=5`, `HUMAN_CAPACITY=3`, `QUEUE_CAPACITY=2`) so the cascade is
-readable.
+`sim` drives the router with synthetic calls so you can watch decisions without
+dialling. Use small capacities (`AI_CAPACITY=5`, `HUMAN_CAPACITY=3`,
+`QUEUE_CAPACITY=2`) so the cascade is readable.
 
 `ALLOW_FORCE_ROUTE=true` enables `?force=human|ai` to pin a branch. Off by
 default so it can't be used against a production answer URL.
-
-`python mock_backend.py` stands in for a backend on `:8091` and prints every
-field the router forwards.
 
 ---
 
@@ -324,12 +326,18 @@ Worked around in the code — reintroduce them at your peril.
 
 ## Architecture
 
+Eight files, nothing hidden:
+
 ```
-router.py    pure decision engine — no I/O, no globals, no framework
-state.py     capacity accounting (TTL-swept), caller history, decision log
-app.py       Vobiz webhooks and the XML for each destination
-vobiz.py     REST calls (outbound call, live transfer)
-sim.py       narrated scenarios     verify.py   11 end-to-end assertions
+app.py           Vobiz webhooks, the XML for each destination, and the two
+                 REST calls it makes (outbound call, live transfer)
+router.py        pure decision engine — no I/O, no globals, no framework
+state.py         capacity accounting (TTL-swept), caller history, decision log
+test.py          verify · sim · mock backend · place a real call
+console.html     the live view
+.env.example     every setting, annotated
+README.md        this
+requirements.txt · LICENSE
 ```
 
 `router.py` takes identity, history, capacity and config and returns a decision

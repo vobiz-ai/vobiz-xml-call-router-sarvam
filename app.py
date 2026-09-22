@@ -45,7 +45,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-import vobiz
 from router import (CallerHistory, Config, Identity, decide, normalise,
                     resolve_identity)
 from state import AgentPool, DecisionLog, History, Slots
@@ -151,6 +150,69 @@ ALLOW_FORCE_ROUTE = os.getenv("ALLOW_FORCE_ROUTE", "false").lower() == "true"
 SPEAK = 'voice="{v}" language="{l}"'.format(
     v=os.getenv("SPEAK_VOICE", "WOMAN"), l=os.getenv("SPEAK_LANGUAGE", "en-IN")
 )
+
+# ===========================================================================
+#  Vobiz REST
+# ===========================================================================
+
+API_BASE = "https://api.vobiz.ai/api/v1"
+REST_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Auth-ID": os.getenv("VOBIZ_AUTH_ID", ""),
+    "X-Auth-Token": os.getenv("VOBIZ_AUTH_TOKEN", ""),
+}
+
+
+class VobizError(RuntimeError):
+    """Raised instead of exiting, because this module runs inside a server.
+
+    sys.exit in a request handler raises SystemExit — a BaseException that most
+    `except Exception` guards miss and that can take the worker down.
+    """
+
+
+def _require_credentials():
+    if not REST_HEADERS["X-Auth-ID"] or not REST_HEADERS["X-Auth-Token"]:
+        raise VobizError("VOBIZ_AUTH_ID and VOBIZ_AUTH_TOKEN must be set in .env")
+
+
+def transfer_call(call_uuid: str, aleg_url: str) -> dict:
+    """POST /Account/{auth_id}/Call/{call_uuid}/ — redirects a live leg.
+
+    Returns 202. The leg abandons its current XML document immediately, so
+    whatever it was doing stops the moment this is accepted.
+    """
+    _require_credentials()
+    r = httpx.post(
+        f"{API_BASE}/Account/{REST_HEADERS['X-Auth-ID']}/Call/{call_uuid}/",
+        json={"legs": "aleg", "aleg_url": aleg_url, "aleg_method": "POST"},
+        headers=REST_HEADERS, timeout=30)
+    try:
+        return {"status": r.status_code, "body": r.json()}
+    except ValueError:
+        return {"status": r.status_code, "body": r.text[:500]}
+
+
+def place_call(to: str, answer_url: str, hangup_url: str, **advanced) -> dict:
+    """POST /Account/{auth_id}/Call/ — queues an outbound call.
+
+    A 401 means credentials, a 402 means balance, and a `to`-parameter error
+    means both are fine. Check in that order before debugging code.
+    """
+    _require_credentials()
+    payload = {
+        "from": os.getenv("FROM_NUMBER", ""), "to": to,
+        "answer_url": answer_url, "answer_method": "POST",
+        "hangup_url": hangup_url, "hangup_method": "POST",
+    }
+    payload.update({k: v for k, v in advanced.items() if v is not None})
+    r = httpx.post(f"{API_BASE}/Account/{REST_HEADERS['X-Auth-ID']}/Call/",
+                   json=payload, headers=REST_HEADERS, timeout=30)
+    if r.status_code >= 400:
+        raise VobizError(f"Vobiz returned {r.status_code}: {r.text}")
+    return r.json()
+
+
 
 # --- Shared state ----------------------------------------------------------
 
@@ -746,7 +808,7 @@ async def escalate(request: Request):
     base = base_url(request)
     target = f"{base}/transfer-target?agent={quote(agent['number'])}"
     try:
-        result = vobiz.transfer_call(uuid, target)
+        result = transfer_call(uuid, target)
     except Exception as exc:
         # The transfer did not happen, so undo the bookkeeping that assumed it
         # would. Leaving the agent marked busy would quietly shrink the pool.
@@ -910,8 +972,39 @@ async def _sweeper():
     asyncio.create_task(loop())
 
 
+def _reclaim_port(port: int):
+    """Kill whatever is already listening on our port.
+
+    Without this, a second `python app.py` fails to bind, exits, and leaves the
+    OLD process serving — so code changes appear to do nothing. That costs an
+    afternoon exactly once.
+    """
+    import signal
+    import subprocess
+
+    try:
+        out = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return
+    for pid in [p for p in out.split() if p.isdigit() and int(p) != os.getpid()]:
+        print(f"  reclaiming port {port} from pid {pid}")
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except OSError:
+            continue
+        for _ in range(20):
+            try:
+                os.kill(int(pid), 0)
+                time.sleep(0.2)
+            except OSError:
+                break
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    _reclaim_port(PORT)
 
     print(f"  answer URL   {PUBLIC_URL or 'http://127.0.0.1:' + str(PORT)}/answer")
     print(f"  hangup URL   {PUBLIC_URL or 'http://127.0.0.1:' + str(PORT)}/hangup")
