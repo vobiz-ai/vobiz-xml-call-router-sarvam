@@ -25,7 +25,7 @@ from pathlib import Path
 
 from router import Capacity, CallerHistory, Config
 
-DB_PATH = Path(__file__).parent / "data" / "ipac.db"
+DB_PATH = Path(__file__).parent / "data" / "router.db"
 
 
 def _now() -> float:
@@ -207,8 +207,8 @@ class History:
                     first_seen   TEXT NOT NULL,
                     last_seen    TEXT NOT NULL,
                     call_count   INTEGER NOT NULL DEFAULT 0,
-                    complaint_id TEXT DEFAULT '',
-                    last_summary TEXT DEFAULT ''
+                    reference    TEXT DEFAULT '',
+                    summary      TEXT DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS calls (
                     call_uuid    TEXT PRIMARY KEY,
@@ -258,9 +258,9 @@ class History:
         return CallerHistory(
             known=True,
             call_count=row["call_count"],
-            complaint_id=row["complaint_id"] or "",
+            reference=row["reference"] or "",
             last_seen=row["last_seen"],
-            last_summary=row["last_summary"] or "",
+            summary=row["summary"] or "",
         )
 
     def record_call(self, number: str, call_uuid: str, identity_src: str, route: str,
@@ -303,22 +303,23 @@ class History:
                 (_iso(_now()), computed, call_uuid),
             )
 
-    def set_complaint(self, number: str, complaint_id: str, summary: str = ""):
-        """What a Sarvam agent writes back at the end of a conversation, so the
-        next call can be routed with it."""
+    def set_reference(self, number: str, reference: str, summary: str = ""):
+        """What the backend writes back at the end of a conversation — a ticket
+        or case number — so the next call from this caller can be routed
+        with it."""
         now = _iso(_now())
         with self._lock, self._connect() as db:
             db.execute(
                 """
                 INSERT INTO callers (number, first_seen, last_seen, call_count,
-                                     complaint_id, last_summary)
+                                     reference, summary)
                 VALUES (?, ?, ?, 0, ?, ?)
                 ON CONFLICT(number) DO UPDATE SET
-                    complaint_id = excluded.complaint_id,
-                    last_summary = excluded.last_summary,
-                    last_seen    = excluded.last_seen
+                    reference = excluded.reference,
+                    summary   = excluded.summary,
+                    last_seen = excluded.last_seen
                 """,
-                (number, now, now, complaint_id, summary),
+                (number, now, now, reference, summary),
             )
 
     def record_missed(self, number: str, reason: str):
@@ -355,9 +356,8 @@ class History:
 class DecisionLog:
     """The last N routing decisions, with the full reasoning trail.
 
-    This is the artefact of the PoC. Being able to point at a call and read
-    back "ForwardedFrom was absent, so the caller was unidentifiable, so the
-    repeat-caller branch was skipped" is the whole argument about the SIM.
+    "Why did this call go to a human?" is the question a routing layer gets
+    asked, and reconstructing it afterwards from platform logs is miserable.
     """
 
     def __init__(self, size: int = 200):

@@ -1,27 +1,31 @@
 """
-app.py — the IPAC routing layer
-================================
-Sits between Vobiz and Sarvam. Vobiz posts every inbound call here; this
-service decides where the call goes and returns the XML that sends it there.
+app.py — a routing layer for programmable voice
+================================================
+Sits between a programmable-voice platform and whatever should handle the
+call. The platform posts every inbound call here; this service decides where
+it goes and returns the XML that sends it there.
 
-    Vobiz --answer_url--> IPAC --+--> <Stream> to Sarvam   (media: Vobiz <-> Sarvam)
-                                 +--> <Dial>   to a human agent
-                                 +--> hold, then re-decide
-                                 +--> reject unanswered, capture the number
+    caller → platform --answer_url--> router --+--> <Stream> to an AI backend
+                                               +--> <Dial> to a human or SIP endpoint
+                                               +--> hold, re-decide when a channel frees
+                                               +--> reject unanswered, capture the number
 
 Media never passes through this service. It is control plane only: one HTTP
 round trip before the call is answered, and no added audio latency.
 
+Written against Vobiz's XML dialect, which Plivo shares and Twilio closely
+resembles. Swapping platform means changing the XML builders near the top and
+the REST calls in vobiz.py; the decision engine in router.py is independent
+of all of it.
+
 Run:
     pip install -r requirements.txt
-    cp .env.example .env         # set PUBLIC_URL and the Vobiz credentials
-    python app.py                # listens on :8090
+    cp .env.example .env         # set PUBLIC_URL
+    ./run.sh                     # listens on :8090
     open http://127.0.0.1:8090/  # live console
 
-Then set your Vobiz application's Answer URL to
-    {PUBLIC_URL}/answer
-and its Hangup URL to
-    {PUBLIC_URL}/hangup
+Then point your voice application's Answer URL at {PUBLIC_URL}/answer and its
+Hangup URL at {PUBLIC_URL}/hangup.
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ load_dotenv(Path(__file__).parent / ".env", override=True)
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("ipac")
+log = logging.getLogger("router")
 
 
 def _int(name: str, default: int) -> int:
@@ -78,39 +82,63 @@ CONFIG = Config(
     repeat_window_days=_int("REPEAT_WINDOW_DAYS", 30),
 )
 
-# How the AI branch is fulfilled:
-#   stream — return <Stream> pointing at Sarvam's websocket (the real thing)
-#   proxy  — fetch XML from Sarvam's own answer URL and pass it through
-#   stub   — <Speak> what would have happened, so routing is testable with no
-#            Sarvam dependency at all. This is the default on purpose: it lets
-#            the routing layer be proven before Sarvam is wired up.
+# How the AI branch is fulfilled. None of this names a particular vendor:
+#   stub   — <Speak> describing the decision. No backend needed at all, which
+#            is what lets the routing layer be proven before one is wired up.
+#   proxy  — POST the call to the backend's own answer URL and return the XML
+#            it replies with. Use when the backend issues its own XML and
+#            expects to create a session per call.
+#   stream — return a <Stream> to a websocket this service builds. Use when
+#            the backend takes a raw media socket.
 AI_MODE = os.getenv("AI_MODE", "stub")
-SARVAM_STREAM_WS = os.getenv("SARVAM_STREAM_WS", "")
-SARVAM_STREAM_WS_REPEAT = os.getenv("SARVAM_STREAM_WS_REPEAT", "") or SARVAM_STREAM_WS
-SARVAM_ANSWER_URL = os.getenv("SARVAM_ANSWER_URL", "")
-SARVAM_TIMEOUT_S = float(os.getenv("SARVAM_TIMEOUT_S", "2.0"))
 
-# Hand Sarvam the caller we resolved, in the `From` field it already reads.
-# Once IPAC is in front, Sarvam no longer receives the call from Vobiz — it
-# receives whatever IPAC forwards. So IPAC is the only thing that can give it
-# a usable caller number: on a forwarded call the real citizen arrives in
-# ForwardedFrom, and Sarvam reading `From` would otherwise see the SIM.
-# The untouched original is always preserved as OriginalFrom.
+# proxy mode
+AI_ANSWER_URL = os.getenv("AI_ANSWER_URL", "")
+# Backends commonly select which agent answers from the number the call came
+# in on. Rewriting `To` therefore re-points the call at a different agent —
+# powerful, but if nothing is listening on that identifier the backend may
+# accept the connection and drop it with no error. Off by default: the dialled
+# number is normally already bound to the right agent.
+PROXY_REWRITE_TO = os.getenv("PROXY_REWRITE_TO", "false").lower() == "true"
+
+# stream mode
+AI_STREAM_URL = os.getenv("AI_STREAM_URL", "")
+AI_CONTENT_TYPE = os.getenv("AI_CONTENT_TYPE", "audio/x-mulaw;rate=8000")
+
+# Optional identifier naming which agent should answer, per pool. Leave empty
+# to let the backend decide from the dialled number.
+AI_TARGET_NEW = os.getenv("AI_TARGET_NEW", "")
+AI_TARGET_REPEAT = os.getenv("AI_TARGET_REPEAT", "") or AI_TARGET_NEW
+
+# Every backend spells its query parameters differently. Rather than hardcode
+# one vendor's names, map our canonical fields onto theirs:
+#   STREAM_PARAM_MAP=caller:user_phone_number,target:agent_phone_number,call_id:call_sid
+# Unmapped fields keep their canonical name.
+def _parse_map(raw: str) -> dict:
+    out = {}
+    for pair in raw.split(","):
+        if ":" in pair:
+            k, _, v = pair.partition(":")
+            if k.strip() and v.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+STREAM_PARAM_MAP = _parse_map(os.getenv("STREAM_PARAM_MAP", ""))
+
+# Prefix for the context fields this service adds alongside the backend's own.
+CONTEXT_PREFIX = os.getenv("CONTEXT_PREFIX", "router_")
+
+AI_TIMEOUT_S = float(os.getenv("AI_TIMEOUT_S", "2.0"))
+AI_FALLBACK_TEXT = os.getenv(
+    "AI_FALLBACK_TEXT",
+    "We could not connect you to an agent. Please try again shortly.")
+
+# Hand the backend the caller we resolved, in the field it already reads. Once
+# this service is in front, the backend no longer receives the call from the
+# platform — it receives what we forward, so this is the only place that can
+# give it a usable caller. The untouched original is kept as OriginalFrom.
 FORWARD_RESOLVED_FROM = os.getenv("FORWARD_RESOLVED_FROM", "true").lower() == "true"
-
-# Sarvam's own integration, read off a live call: it returns a <Stream> to this
-# websocket and selects the agent by `agent_phone_number`, taking the caller as
-# `user_phone_number`. Building that URL here instead of asking Sarvam to build
-# it is what lets us hand it the real caller: no second call leg is created, so
-# nothing can strip the identity on the way.
-SARVAM_WSS = os.getenv(
-    "SARVAM_WSS", "wss://apps.sarvam.ai/api/app-runtime/v1/channels/vobiz")
-# Numbers registered with Sarvam, one per agent. This is how IPAC chooses
-# between the new-caller and repeat-caller agents.
-SARVAM_AGENT_NEW = os.getenv("SARVAM_AGENT_NEW", "")
-SARVAM_AGENT_REPEAT = os.getenv("SARVAM_AGENT_REPEAT", "") or SARVAM_AGENT_NEW
-# Sarvam streams L16 8 kHz, not mulaw.
-SARVAM_CONTENT_TYPE = os.getenv("SARVAM_CONTENT_TYPE", "audio/x-l16;rate=8000")
 
 CALLER_ID = os.getenv("CALLER_ID", "") or os.getenv("FROM_NUMBER", "")
 AGENT_NUMBERS = [n.strip() for n in os.getenv("AGENT_NUMBERS", "").split(",") if n.strip()]
@@ -138,7 +166,7 @@ queue_cycles: dict[str, int] = {}
 # caller must not lose their identity just because they were put on hold.
 call_context: dict[str, tuple[Identity, CallerHistory]] = {}
 
-app = FastAPI(title="IPAC router")
+app = FastAPI(title="Call router")
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -211,27 +239,44 @@ def sip_safe(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9]", "", value or "")
 
 
-def ws_with_context(ws_url: str, decision, params: dict) -> str:
-    """Hand the caller's context to Sarvam on the websocket query string.
+def stream_url(decision, params: dict) -> str:
+    """Build the backend's websocket URL, carrying who is calling.
 
-    Custom SIP headers are not an option here: X-VH-* headers reach the
-    dialling application's own callbacks, not a streaming endpoint.
+    The caller travels as a query parameter because no second call leg exists
+    to carry it any other way — and that is the point: nothing in the path can
+    strip an identity that never leaves the original leg.
+
+    Field names are mapped through STREAM_PARAM_MAP so this works against a
+    backend that spells them differently, without changing code.
     """
-    if not ws_url:
+    if not AI_STREAM_URL:
         return ""
-    ctx = {
-        "pool": decision.pool,
-        "caller": decision.identity.best() or "unknown",
-        "identified": str(decision.identity.confident).lower(),
-        "call_uuid": params.get("CallUUID", ""),
+
+    target = AI_TARGET_REPEAT if decision.pool == "ai_repeat" else AI_TARGET_NEW
+
+    canonical = {
+        "caller": decision.identity.best() or params.get("From", ""),
+        "called": params.get("To", ""),
+        "call_id": params.get("CallUUID", ""),
+        "direction": params.get("Direction", "inbound"),
     }
+    if target:
+        canonical["target"] = target
+
+    ctx = {STREAM_PARAM_MAP.get(k, k): v for k, v in canonical.items() if v}
+
+    # Our own context, namespaced so it cannot collide with the backend's.
+    ctx[f"{CONTEXT_PREFIX}pool"] = decision.pool
+    ctx[f"{CONTEXT_PREFIX}identified"] = str(decision.identity.confident).lower()
+    ctx[f"{CONTEXT_PREFIX}identity_source"] = decision.identity.source
     if decision.history.known:
-        ctx["repeat"] = "true"
-        ctx["prior_calls"] = str(decision.history.call_count)
-        if decision.history.complaint_id:
-            ctx["complaint_id"] = decision.history.complaint_id
-    sep = "&" if "?" in ws_url else "?"
-    return escape(f"{ws_url}{sep}{urlencode(ctx)}")
+        ctx[f"{CONTEXT_PREFIX}repeat_caller"] = "true"
+        ctx[f"{CONTEXT_PREFIX}prior_calls"] = str(decision.history.call_count)
+        if decision.history.reference:
+            ctx[f"{CONTEXT_PREFIX}reference"] = decision.history.reference
+
+    sep = "&" if "?" in AI_STREAM_URL else "?"
+    return escape(f"{AI_STREAM_URL}{sep}{urlencode(ctx)}")
 
 
 async def notify_sms(number: str, reason: str):
@@ -250,30 +295,31 @@ async def notify_sms(number: str, reason: str):
 
 
 def xml_ai(decision, params: dict, request: Request) -> Response:
+    """The AI branch, in whichever mode is configured."""
     base = base_url(request)
-    label = "repeat caller" if decision.pool == "ai_repeat" else "new caller"
 
-    if AI_MODE == "stream":
-        ws = SARVAM_STREAM_WS_REPEAT if decision.pool == "ai_repeat" else SARVAM_STREAM_WS
-        target = ws_with_context(ws, decision, params)
-        if target:
-            return xml(
-                f"""    <Stream bidirectional="true"
+    if AI_MODE == "stream" and AI_STREAM_URL:
+        # A bare <Hangup/> after <Stream> means any socket failure ends the
+        # call in about a second with nothing to hear. A spoken fallback makes
+        # a backend outage audible instead of looking like a dropped call.
+        return xml(
+            f"""    <Stream bidirectional="true"
             keepCallAlive="true"
-            contentType="audio/x-mulaw;rate=8000"
+            contentType="{AI_CONTENT_TYPE}"
             statusCallbackUrl="{base}/stream-status"
             statusCallbackMethod="POST">
-        {target}
+        {stream_url(decision, params)}
     </Stream>
+    <Speak {SPEAK}>{escape(AI_FALLBACK_TEXT)}</Speak>
     <Hangup/>"""
-            )
+        )
 
-    # stub, or stream with nothing configured to stream to
+    # stub, or a mode with nothing configured to reach
+    label = "repeat caller" if decision.pool == "ai_repeat" else "new caller"
     greeting = (
-        f"Welcome back. I can see your previous complaint. "
-        f"You have called {decision.history.call_count} times before."
+        f"Welcome back. You have called {decision.history.call_count} times before."
         if decision.history.known
-        else "Thank you for calling the helpline. How can I help you today?"
+        else "Thank you for calling. How can I help you today?"
     )
     return xml(
         f"""    <Speak {SPEAK}>{escape(greeting)}</Speak>
@@ -283,115 +329,69 @@ def xml_ai(decision, params: dict, request: Request) -> Response:
     )
 
 
-def sarvam_stream_url(decision, params: dict) -> str:
-    """Build Sarvam's websocket URL with the caller we actually resolved."""
-    agent = SARVAM_AGENT_REPEAT if decision.pool == "ai_repeat" else SARVAM_AGENT_NEW
-    ctx = {
-        "agent_phone_number": agent,
-        # The real citizen when we have one; otherwise whatever arrived, so
-        # Sarvam is never handed an empty caller.
-        "user_phone_number": decision.identity.best() or params.get("From", ""),
-        "call_sid": params.get("CallUUID", ""),
-        "call_direction": params.get("Direction", "inbound"),
-    }
-    # Our own context travels alongside Sarvam's parameters; unknown query
-    # parameters are ignored by a server that does not read them.
-    ctx["ipac_identified"] = str(decision.identity.confident).lower()
-    ctx["ipac_identity_source"] = decision.identity.source
-    if decision.history.known:
-        ctx["ipac_repeat_caller"] = "true"
-        ctx["ipac_prior_calls"] = str(decision.history.call_count)
-        if decision.history.complaint_id:
-            ctx["ipac_complaint_id"] = decision.history.complaint_id
-    sep = "&" if "?" in SARVAM_WSS else "?"
-    return escape(f"{SARVAM_WSS}{sep}{urlencode(ctx)}")
+def backend_payload(decision, params: dict) -> dict:
+    """What the backend receives. Everything the platform sent, plus who is calling.
 
-
-def xml_sarvam_stream(decision, params: dict, request: Request) -> Response:
-    """<Stream> straight to Sarvam, built by us.
-
-    Sarvam's own XML ends with a bare <Hangup/> after the <Stream>, which is
-    why a failed websocket drops the call in about a second with no
-    explanation. A spoken fallback replaces it, so a Sarvam outage is audible
-    instead of looking like a dropped call.
-    """
-    base = base_url(request)
-    return xml(
-        f"""    <Stream bidirectional="true"
-            keepCallAlive="true"
-            contentType="{SARVAM_CONTENT_TYPE}"
-            statusCallbackUrl="{base}/stream-status"
-            statusCallbackMethod="POST">
-        {sarvam_stream_url(decision, params)}
-    </Stream>
-    <Speak {SPEAK}>We could not connect you to an agent. Please try again shortly.</Speak>
-    <Hangup/>"""
-    )
-
-
-def sarvam_payload(decision, params: dict) -> dict:
-    """What Sarvam receives. Everything Vobiz sent, plus who the caller is.
-
-    `From` is overwritten with the resolved citizen number so Sarvam's existing
+    `From` is overwritten with the resolved caller so the backend's existing
     handling works unchanged; `OriginalFrom` keeps whatever Vobiz actually sent
     (the SIM, on a forwarded call) so nothing is lost.
     """
     payload = dict(params)
     resolved = decision.identity.best()      # keeps the country code
 
-    # Sarvam selects the agent from `To`, so rewriting it re-points the call at
+    # Backends commonly select the agent from `To`, so rewriting it re-points
     # a different agent. Default is to pass `To` straight through: the DID the
     # citizen dialled is already bound to the right agent, and rewriting it to
-    # a number with no working agent behind it makes Sarvam accept the
+    # the call. A number with no live agent behind it makes a backend accept the
     # websocket and close it immediately, which reads as a dropped call.
     #
-    # Only set SARVAM_AGENT_* when you specifically want IPAC to choose a
+    # Only set AI_TARGET_* when you specifically want this service to choose a
     # different agent than the dialled number implies (a repeat-caller agent,
-    # say) — and only to numbers with a live agent on Sarvam's side.
-    agent_number = SARVAM_AGENT_REPEAT if decision.pool == "ai_repeat" else SARVAM_AGENT_NEW
-    if agent_number and agent_number != params.get("To", ""):
+    # say) — and only to identifiers with a live agent behind them.
+    agent_number = AI_TARGET_REPEAT if decision.pool == "ai_repeat" else AI_TARGET_NEW
+    if PROXY_REWRITE_TO and agent_number and agent_number != params.get("To", ""):
         payload["OriginalTo"] = params.get("To", "")
         payload["To"] = agent_number
         decision.considered.append(
-            f"Sarvam agent re-pointed to {agent_number} (To rewritten)")
+            f"backend target re-pointed to {agent_number} (To rewritten)")
 
     if FORWARD_RESOLVED_FROM and resolved and decision.identity.confident:
         payload["OriginalFrom"] = params.get("From", "")
         payload["From"] = resolved
-        payload["IpacFromRewritten"] = "true"
+        payload["RouterFromRewritten"] = "true"
     else:
         payload["OriginalFrom"] = params.get("From", "")
-        payload["IpacFromRewritten"] = "false"
+        payload["RouterFromRewritten"] = "false"
 
     payload.update(
         {
-            "IpacPool": decision.pool,
-            "IpacCaller": resolved,
-            "IpacCallerNormalised": decision.identity.number,
-            "IpacIdentitySource": decision.identity.source,
-            "IpacIdentified": str(decision.identity.confident).lower(),
-            "IpacIdentityNote": decision.identity.note,
-            "IpacRepeatCaller": str(decision.history.known).lower(),
-            "IpacPriorCalls": str(decision.history.call_count),
-            "IpacComplaintId": decision.history.complaint_id,
-            "IpacLastSummary": decision.history.last_summary,
+            "RouterPool": decision.pool,
+            "RouterCaller": resolved,
+            "RouterCallerNormalised": decision.identity.number,
+            "RouterIdentitySource": decision.identity.source,
+            "RouterIdentified": str(decision.identity.confident).lower(),
+            "RouterIdentityNote": decision.identity.note,
+            "RouterRepeatCaller": str(decision.history.known).lower(),
+            "RouterPriorCalls": str(decision.history.call_count),
+            "RouterReference": decision.history.reference,
+            "RouterSummary": decision.history.summary,
         }
     )
     return payload
 
 
-def instrument_stream(sarvam_xml: str, request: Request) -> str:
+def instrument_stream(backend_xml: str, request: Request) -> str:
     """Add our statusCallbackUrl to a <Stream> that has none.
 
-    Sarvam's XML sets no status callback, so Vobiz posts stream events to the
+    A backend's XML often sets no status callback, so the platform posts stream events to the
     literal string "no-stream-status-callback-url" and they are lost. Adding
     ours changes nothing about the call and makes stream failures visible here
     instead of only in the platform's own logs.
     """
     try:
-        root = ET.fromstring(sarvam_xml)
+        root = ET.fromstring(backend_xml)
     except ET.ParseError:
-        return sarvam_xml          # not ours to fix; pass it through untouched
+        return backend_xml          # not ours to fix; pass it through untouched
 
     base = base_url(request)
     changed = False
@@ -401,28 +401,28 @@ def instrument_stream(sarvam_xml: str, request: Request) -> str:
             stream.set("statusCallbackMethod", "POST")
             changed = True
     if not changed:
-        return sarvam_xml
+        return backend_xml
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(
         root, encoding="unicode")
 
 
 async def xml_ai_proxy(decision, params: dict, request: Request) -> Response:
-    """Ask Sarvam's own answer URL for the XML and pass it straight through.
+    """Ask the backend's own answer URL for the XML and pass it straight through.
 
-    Used when Sarvam gives you an answer URL rather than a stream endpoint.
-    The routing context travels as extra POST fields, so Sarvam can see which
+    Used when the backend exposes an answer URL rather than a stream endpoint.
+    The routing context travels as extra POST fields, so the backend can see which
     agent it is being asked to be.
     """
-    payload = sarvam_payload(decision, params)
+    payload = backend_payload(decision, params)
     try:
-        async with httpx.AsyncClient(timeout=SARVAM_TIMEOUT_S) as client:
-            r = await client.post(SARVAM_ANSWER_URL, data=payload)
+        async with httpx.AsyncClient(timeout=AI_TIMEOUT_S) as client:
+            r = await client.post(AI_ANSWER_URL, data=payload)
         if r.status_code == 200 and "<Response" in r.text:
             return Response(content=instrument_stream(r.text, request),
                             media_type="application/xml")
-        reason = f"Sarvam returned {r.status_code}"
+        reason = f"backend returned {r.status_code}"
     except Exception as exc:
-        reason = f"Sarvam unreachable: {type(exc).__name__}"
+        reason = f"backend unreachable: {type(exc).__name__}"
 
     # Fail loudly in the log, gracefully on the call.
     decision.considered.append(f"AI proxy failed ({reason}) -> falling back")
@@ -442,8 +442,8 @@ def xml_human(decision, params: dict, request: Request, agent: dict) -> Response
         "Caller": sip_safe(decision.identity.number),
         "Repeat": "true" if decision.history.known else "false",
     }
-    if decision.history.complaint_id:
-        headers["Complaint"] = sip_safe(decision.history.complaint_id)
+    if decision.history.reference:
+        headers["Complaint"] = sip_safe(decision.history.reference)
     sip_headers = ",".join(f"{k}={v}" for k, v in headers.items() if v)
 
     caller_id_attr = f'callerId="{escape(CALLER_ID)}"\n          ' if CALLER_ID else ""
@@ -621,13 +621,11 @@ async def _fulfil(decision, params: dict, request: Request, uuid: str, started: 
             slots.reserve(uuid, decision.pool, decision.identity.number)
         history.record_call(decision.identity.number, uuid, decision.identity.source,
                             route, decision.pool, decision.reason)
-        if AI_MODE == "proxy" and SARVAM_ANSWER_URL:
+        if AI_MODE == "proxy" and AI_ANSWER_URL:
             response = await xml_ai_proxy(decision, params, request)
-        elif AI_MODE == "sarvam_stream" and SARVAM_AGENT_NEW:
-            response = xml_sarvam_stream(decision, params, request)
         else:
             response = xml_ai(decision, params, request)
-        # Logged after the proxy call so a Sarvam failure shows in the trail.
+        # Logged after the proxy call so a backend failure shows in the trail.
         decisions.add(uuid, decision, (time.perf_counter() - started) * 1000, params)
         return response
 
@@ -731,7 +729,7 @@ async def stream_status(request: Request):
 async def escalate(request: Request):
     """Move a live AI call to a human.
 
-    The transfer API is a redirect, not a bridge: the leg abandons Sarvam's
+    The transfer API is a redirect, not a bridge: the leg abandons the backend's
     XML and starts executing whatever /transfer-target returns.
     """
     body = await call_params(request)
@@ -809,15 +807,15 @@ async def agents_endpoint(request: Request):
     return JSONResponse({"agents": agents.all(), "available": len(agents.available())})
 
 
-@app.post("/complaint")
-async def complaint(request: Request):
-    """Where Sarvam writes back at the end of a conversation, so the next call
+@app.post("/reference")
+async def reference(request: Request):
+    """Where the backend writes back at the end of a conversation, so the next call
     from this number can be routed as a repeat caller with context."""
     body = await call_params(request)
     number = normalise(body.get("number", ""))
     if not number:
         return JSONResponse({"ok": False, "error": "number required"}, status_code=400)
-    history.set_complaint(number, body.get("complaint_id", ""), body.get("summary", ""))
+    history.set_reference(number, body.get("reference", ""), body.get("summary", ""))
     return JSONResponse({"ok": True, "number": number})
 
 

@@ -70,7 +70,7 @@ def transfer_call(call_uuid: str, aleg_url: str) -> dict:
     """POST /Account/{auth_id}/Call/{call_uuid}/ — redirects a live leg.
 
     Returns 202. The leg abandons its current XML document immediately, so
-    whatever Sarvam was doing on that leg stops the moment this is accepted.
+    whatever the backend was doing on that leg stops the moment this is accepted.
     """
     require_credentials()
     r = requests.post(

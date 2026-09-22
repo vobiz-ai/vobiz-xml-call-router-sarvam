@@ -1,4 +1,8 @@
-"""A stand-in for Sarvam's answer URL, so we can see exactly what IPAC forwards."""
+"""A stand-in backend, so you can see exactly what the router forwards.
+
+Run it, point AI_ANSWER_URL at http://127.0.0.1:8091/answer, place a call,
+and it prints every field the router sent.
+"""
 import json
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
@@ -7,17 +11,17 @@ app = FastAPI()
 seen = []
 
 
-@app.post("/channels/vobiz")
+@app.post("/answer")
 async def channel(request: Request):
     from urllib.parse import parse_qsl
     body = dict(parse_qsl((await request.body()).decode()))
     seen.append(body)
-    print("\n=== what Sarvam receives ===")
+    print("\n=== what the backend receives ===")
     for k in sorted(body):
         print(f"  {k:<22} {body[k]}")
     return Response(
         '<?xml version="1.0" encoding="UTF-8"?>\n<Response>\n'
-        '    <Speak>Sarvam agent speaking.</Speak>\n</Response>',
+        '    <Speak>Mock backend speaking.</Speak>\n</Response>',
         media_type="application/xml")
 
 

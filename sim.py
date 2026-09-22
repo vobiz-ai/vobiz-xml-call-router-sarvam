@@ -168,13 +168,13 @@ def scenario_repeat(diversion: bool):
     line(d1)
     show_trail(d1)
 
-    # Sarvam writes the complaint back at the end of the conversation.
-    requests.post(f"{BASE}/complaint",
-                  data={"number": citizen, "complaint_id": "GRV-2291",
+    # the backend writes a reference back at the end of the conversation.
+    requests.post(f"{BASE}/reference",
+                  data={"number": citizen, "reference": "REF-2291",
                         "summary": "Water supply disruption, ward 14"},
                   timeout=5)
     hangup(d1["_call_uuid"])
-    print(f"\n  {DIM}Sarvam posted complaint GRV-2291 back to /complaint{OFF}")
+    print(f"\n  {DIM}the backend posted reference REF-2291 back to /reference{OFF}")
 
     print("\n  Same citizen calls again:")
     d2 = call(citizen, diversion=diversion)
@@ -183,7 +183,7 @@ def scenario_repeat(diversion: bool):
     hangup(d2["_call_uuid"])
 
     if d2.get("pool") == "ai_repeat":
-        print(f"\n  {G}Routed to the repeat-caller agent with the complaint ID attached.{OFF}")
+        print(f"\n  {G}Routed to the repeat-caller agent with the reference attached.{OFF}")
     else:
         print(f"\n  {Y}Not recognised as a repeat caller.{OFF}")
         if not diversion:

@@ -27,11 +27,11 @@ def ai_shape() -> list[str]:
     """The AI branch emits different verbs per AI_MODE, so read the mode rather
     than hardcoding one shape and reporting a false failure in the others."""
     mode = requests.get(f"{B}/state", timeout=5).json()["ai_mode"]
-    # In proxy mode the XML is Sarvam's, not ours, so its verbs are not ours
+    # In proxy mode the XML is the backend's, not ours, so its verbs are not ours
     # to assert. None means "must parse and route correctly, shape is theirs".
     return {
-        "sarvam_stream": ["Stream", "Speak", "Hangup"],
-        "stream": ["Stream", "Hangup"],
+        "stream": ["Stream", "Speak", "Hangup"],
+        "stream": ["Stream", "Speak", "Hangup"],
         "proxy": None,
     }.get(mode, ["Speak", "Speak", "Wait", "Hangup"])
 
@@ -109,8 +109,8 @@ else:
 print("\nRepeat caller")
 reset(wipe=True)
 answer("rc-1", "917777700002")
-requests.post(f"{B}/complaint", data={"number": "917777700002",
-                                      "complaint_id": "GRV-2291"}, timeout=5)
+requests.post(f"{B}/reference", data={"number": "917777700002",
+                                      "reference": "REF-2291"}, timeout=5)
 requests.post(f"{B}/hangup", data={"CallUUID": "rc-1"}, timeout=5)
 r = answer("rc-2", "917777700002")
 expect("second call -> repeat agent", r, "ai", "ai_repeat",

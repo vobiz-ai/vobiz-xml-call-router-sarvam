@@ -171,9 +171,9 @@ class Capacity:
 class CallerHistory:
     known: bool = False
     call_count: int = 0
-    complaint_id: str = ""
+    reference: str = ""        # whatever the backend writes back (ticket, case, order)
     last_seen: str = ""
-    last_summary: str = ""
+    summary: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +226,7 @@ def decide(
     elif repeat:
         trail.append(
             f"known caller ({history.call_count} prior calls"
-            + (f", complaint {history.complaint_id}" if history.complaint_id else "")
+            + (f", ref {history.reference}" if history.reference else "")
             + ") -> repeat-caller agent"
         )
     elif identity.confident:
