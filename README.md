@@ -81,6 +81,60 @@ curl -X POST ".../Account/$AUTH_ID/numbers/%2B<E164>/application" \
 
 ---
 
+## Deploying for a customer
+
+Every customer has their own Sarvam URL, their own DID, and their own agents.
+**Run one router per customer** — one `.env`, one port, one tunnel or host.
+The router holds live capacity counters and caller history in that process, so
+keeping customers in separate instances keeps their state separate too.
+
+Everything customer-specific is in `.env`:
+
+```bash
+# ── the customer's Sarvam app ────────────────────────────────────────────
+AI_MODE=proxy
+AI_ANSWER_URL=https://apps.sarvam.ai/api/app-runtime/v1/channels/vobiz
+#              ^ the customer's own app-runtime URL, if it differs
+
+# ── the customer's Vobiz account ─────────────────────────────────────────
+VOBIZ_AUTH_ID=MA_XXXXXXXX
+VOBIZ_AUTH_TOKEN=...
+CALLER_ID=+91XXXXXXXXXX          # a number THIS account owns
+FROM_NUMBER=+91XXXXXXXXXX
+
+# ── this instance ────────────────────────────────────────────────────────
+PUBLIC_URL=https://customer-a.yourdomain.com
+PORT=8090                        # a different port per instance on one host
+
+# ── the customer's routing policy ────────────────────────────────────────
+ROUTE_POLICY=ai_first
+AI_CAPACITY=50
+HUMAN_CAPACITY=30
+AGENT_NUMBERS=+91XXXXXXXXXX,sip:agent@customer-pbx.example.com
+INBOUND_MODE=direct_did          # sim_forward if a SIM forwards to their DID
+```
+
+**You do not configure the DID here.** The customer's inbound number is
+attached to their Sarvam agent on Sarvam's side, and to the router's
+application on Vobiz's side. The router reads the dialled number from the call
+and passes it straight through as `To`, which is how Sarvam knows which agent
+should answer. That is also why `PROXY_REWRITE_TO` stays off unless you
+deliberately want a different agent — see [Sarvam](#sarvam).
+
+So per customer:
+
+1. Copy `.env.example` to `.env`, fill in the block above.
+2. Start the instance, give it a public HTTPS URL.
+3. Create a Vobiz application pointing at that URL, with
+   `fallback_answer_url` set to the customer's Sarvam URL.
+4. Attach the customer's DID to that application.
+5. Call it.
+
+Nothing about the customer lives in code — a new customer is a new `.env` and
+a new application.
+
+---
+
 ## Sarvam
 
 Sarvam exposes an answer URL and replies with its own XML, so use proxy mode:
