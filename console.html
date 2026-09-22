@@ -1,0 +1,114 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>IPAC router</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fbfaf8; --fg:#1a1a1a; --dim:#6b6b6b;
+          --line:#e2ded8; --card:#fff; --ai:#2f7d4f; --human:#2b5fa8;
+          --queue:#a8752b; --reject:#a83232; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16161a; --fg:#e8e6e3; --dim:#9a9a9a; --line:#2c2c33;
+            --card:#1e1e24; --ai:#5cc98a; --human:#6fa8f5; --queue:#e0aa5c;
+            --reject:#f07a7a; }
+  }
+  * { box-sizing:border-box }
+  body { margin:0; padding:24px 16px; background:var(--bg); color:var(--fg);
+         font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",sans-serif; }
+  .wrap { max-width:1100px; margin:0 auto }
+  h1 { font-size:18px; margin:0 0 2px; font-weight:600 }
+  .sub { color:var(--dim); font-size:13px; margin-bottom:20px }
+  .pools { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+           gap:12px; margin-bottom:24px }
+  .pool { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:14px 16px }
+  .pool h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+             color:var(--dim); margin:0 0 8px; font-weight:600 }
+  .n { font-size:26px; font-weight:600; font-variant-numeric:tabular-nums }
+  .n small { font-size:14px; color:var(--dim); font-weight:400 }
+  .bar { height:5px; background:var(--line); border-radius:3px; margin-top:10px;
+         overflow:hidden }
+  .bar i { display:block; height:100% }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+       color:var(--dim); margin:24px 0 10px; font-weight:600 }
+  table { width:100%; border-collapse:collapse; font-size:13px }
+  th { text-align:left; font-weight:500; color:var(--dim); padding:6px 10px;
+       border-bottom:1px solid var(--line); font-size:12px }
+  td { padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top }
+  .tag { display:inline-block; padding:1px 8px; border-radius:20px; font-size:12px;
+         font-weight:500; color:#fff }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px }
+  .dim { color:var(--dim) }
+  .trail { color:var(--dim); font-size:12px; margin:3px 0 0; padding-left:14px }
+  .warn { color:var(--queue) }
+  .scroll { overflow-x:auto }
+  .empty { color:var(--dim); padding:20px 10px }
+</style>
+<div class="wrap">
+  <h1>IPAC router</h1>
+  <div class="sub" id="meta">connecting…</div>
+  <div class="pools" id="pools"></div>
+  <h3>Recent decisions</h3>
+  <div class="scroll"><table>
+    <thead><tr><th>time</th><th>route</th><th>caller</th><th>identity</th>
+      <th>ms</th><th>reasoning</th></tr></thead>
+    <tbody id="rows"><tr><td colspan="6" class="empty">no calls yet</td></tr></tbody>
+  </table></div>
+</div>
+<script>
+const C = {ai:'var(--ai)', human:'var(--human)', queue:'var(--queue)', reject:'var(--reject)'};
+
+function pool(name, p, extra) {
+  const pct = p.cap ? Math.min(100, p.in_use / p.cap * 100) : 0;
+  return `<div class="pool"><h2>${name}</h2>
+    <div class="n">${p.in_use}<small> / ${p.cap}</small></div>
+    <div class="bar"><i style="width:${pct}%;background:${C[name] || 'var(--dim)'}"></i></div>
+    <div class="dim" style="margin-top:6px;font-size:12px">${extra || (p.free + ' free')}</div>
+  </div>`;
+}
+
+async function tick() {
+  let s, d;
+  try {
+    [s, d] = await Promise.all([
+      fetch('/state').then(r => r.json()),
+      fetch('/decisions?n=40').then(r => r.json()),
+    ]);
+  } catch (e) { document.getElementById('meta').textContent = 'router unreachable'; return; }
+
+  const identityWarning = s.inbound_mode === 'sim_forward'
+    ? ' · <span class="warn">SIM forwarding: callers identifiable only when the carrier sends a Diversion header</span>'
+    : '';
+  document.getElementById('meta').innerHTML =
+    `policy <b>${s.policy}</b> · AI mode <b>${s.ai_mode}</b> · inbound <b>${s.inbound_mode}</b>`
+    + (s.leaked_slots_reclaimed ? ` · <span class="warn">${s.leaked_slots_reclaimed} leaked slots reclaimed</span>` : '')
+    + identityWarning;
+
+  const c = s.capacity;
+  document.getElementById('pools').innerHTML =
+      pool('ai', c.ai)
+    + pool('human', c.human, `${c.human.free} free · ${c.human.agents_free} of ${c.human.agents_registered} agents free`)
+    + pool('queue', c.queue)
+    + `<div class="pool"><h2>known callers</h2><div class="n">${s.history.known_callers}</div>
+       <div class="dim" style="margin-top:6px;font-size:12px">${s.history.missed} missed &amp; captured</div></div>`;
+
+  const rows = (d.decisions || []).map(x => {
+    const id = x.identity || {};
+    const trust = id.confident
+      ? `<span class="dim">via ${id.source}</span>`
+      : `<span class="warn">via ${id.source} — not trusted</span>`;
+    const trail = (x.considered || []).map(t => `<div class="trail">· ${t}</div>`).join('');
+    return `<tr>
+      <td class="mono dim">${(x.at || '').slice(11, 19)}</td>
+      <td><span class="tag" style="background:${C[x.route] || 'var(--dim)'}">${x.route}</span>
+          <div class="dim" style="font-size:12px;margin-top:2px">${x.pool}</div></td>
+      <td class="mono">${id.number || '<span class="dim">unidentified</span>'}
+          ${x.repeat_caller ? '<div class="dim" style="font-size:12px">repeat</div>' : ''}</td>
+      <td>${trust}${id.note ? `<div class="trail">${id.note}</div>` : ''}</td>
+      <td class="mono dim">${x.elapsed_ms}</td>
+      <td>${x.reason}${trail}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('rows').innerHTML = rows ||
+    '<tr><td colspan="6" class="empty">no calls yet</td></tr>';
+}
+tick(); setInterval(tick, 2000);
+</script>

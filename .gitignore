@@ -1,0 +1,11 @@
+# Secrets and live config — never commit
+.env
+
+# Runtime artifacts
+.venv/
+__pycache__/
+data/
+*.log
+.tunnel_url
+.router_app_id
+audio/
