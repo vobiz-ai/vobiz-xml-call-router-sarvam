@@ -1,22 +1,19 @@
 """
-sim.py — drive the router without placing real calls
-=====================================================
-Every branch of the routing layer is reachable over HTTP, so the thresholds,
-the queue and the repeat-caller logic can be proven deterministically in a few
-seconds instead of by dialling a hundred times.
+sim.py — drive the router with fake calls
+==========================================
+Every branch is reachable over HTTP, so routing can be watched without dialling
+anything. This is the narrated view; verify.py asserts the same paths and exits
+non-zero on failure — use that in CI, this to see what is happening.
 
     python sim.py identity          how caller identity resolves, with and
                                     without a carrier Diversion header
-    python sim.py fill              ramp calls until AI fills, overflows to
-                                    human, queues, then rejects
-    python sim.py repeat            first-time vs repeat caller routing
+    python sim.py fill              where each capacity threshold trips
+    python sim.py repeat            first-time vs returning caller
     python sim.py queue             a held caller promoted when a slot frees
-    python sim.py escalate-dry      what an AI -> human escalation would do
     python sim.py all
 
     --base http://127.0.0.1:8090    the running router
     --no-diversion                  simulate a carrier that strips Diversion
-                                    (i.e. Jio/Vi rather than Airtel)
 """
 
 from __future__ import annotations
@@ -24,26 +21,26 @@ from __future__ import annotations
 import argparse
 import itertools
 import sys
-import uuid as uuidlib
 
 import requests
 
 BASE = "http://127.0.0.1:8090"
 COUNTER = itertools.count(1)
 
+# Synthetic numbers. Never put real subscriber numbers in a repository.
+FORWARDER = "919999900001"      # the line that forwards, when INBOUND_MODE=sim_forward
+DIALLED = "918888800001"        # the number being called
+CITIZEN = "917777700001"        # a caller
+
 G, Y, R, B, DIM, OFF = "\033[32m", "\033[33m", "\033[31m", "\033[34m", "\033[2m", "\033[0m"
 COLOUR = {"ai": G, "human": B, "queue": Y, "reject": R}
-
-
-def _die(msg: str):
-    sys.exit(f"{R}{msg}{OFF}")
 
 
 def state() -> dict:
     try:
         return requests.get(f"{BASE}/state", timeout=5).json()
     except requests.RequestException as exc:
-        _die(f"Cannot reach the router at {BASE} — is `python app.py` running? ({exc})")
+        sys.exit(f"{R}Cannot reach the router at {BASE} — is it running? ({exc}){OFF}")
 
 
 def reset(wipe_history: bool = False):
@@ -51,247 +48,146 @@ def reset(wipe_history: bool = False):
                   timeout=5)
 
 
-def call(citizen: str, sim_number: str = "919999900001", diversion: bool = True,
-         call_uuid: str = "") -> dict:
-    """One synthetic inbound call, shaped exactly like a Vobiz answer_url POST."""
-    cuid = call_uuid or f"sim-{next(COUNTER):04d}-{uuidlib.uuid4().hex[:8]}"
-    payload = {
-        "CallUUID": cuid,
-        "From": sim_number,          # the SIM, because the call was forwarded
-        "To": "918888800001",
-        "Direction": "inbound",
-        "CallStatus": "ringing",
-        "Event": "StartApp",
-    }
+def call(citizen: str, diversion: bool = True, uuid: str = "") -> dict:
+    """One synthetic inbound call, shaped like a platform answer_url POST."""
+    cuid = uuid or f"sim-{next(COUNTER):04d}"
+    payload = {"CallUUID": cuid, "From": FORWARDER, "To": DIALLED,
+               "Direction": "inbound", "CallStatus": "ringing", "Event": "StartApp"}
     # ForwardedFrom is present only when the carrier emitted a SIP Diversion
     # header. It is omitted entirely when absent — never sent empty.
     if diversion:
         payload["ForwardedFrom"] = citizen
 
-    r = requests.post(f"{BASE}/answer", data=payload, timeout=10)
-    latest = requests.get(f"{BASE}/decisions", params={"n": 1}, timeout=5).json()
-    decision = (latest.get("decisions") or [{}])[0]
-    decision["_xml"] = r.text
-    decision["_call_uuid"] = cuid
-    return decision
+    requests.post(f"{BASE}/answer", data=payload, timeout=10)
+    d = requests.get(f"{BASE}/decisions", params={"n": 1}, timeout=5).json()["decisions"][0]
+    d["_uuid"] = cuid
+    return d
 
 
-def hangup(call_uuid: str):
-    requests.post(f"{BASE}/hangup", data={"CallUUID": call_uuid}, timeout=5)
+def hangup(uuid: str):
+    requests.post(f"{BASE}/hangup", data={"CallUUID": uuid}, timeout=5)
 
 
-def line(d: dict, note: str = ""):
+def show(d: dict, note: str = ""):
     c = COLOUR.get(d.get("route", ""), "")
-    ident = d.get("identity", {})
-    who = ident.get("number") or "unidentified"
-    src = ident.get("source", "?")
-    mark = "" if ident.get("confident") else f" {DIM}(untrusted){OFF}"
-    print(f"  {c}{d.get('route','?'):<7}{OFF} {d.get('pool',''):<10} "
-          f"{who:<12} {DIM}via {src}{OFF}{mark} "
-          f"{DIM}{d.get('elapsed_ms','?')}ms{OFF} {note}")
-
-
-def show_trail(d: dict):
+    i = d.get("identity", {})
+    who = i.get("number") or "unidentified"
+    trust = "" if i.get("confident") else f" {DIM}(untrusted){OFF}"
+    print(f"  {c}{d.get('route','?'):<7}{OFF} {d.get('pool',''):<10} {who:<12} "
+          f"{DIM}via {i.get('source','?')}{OFF}{trust} {DIM}{d.get('elapsed_ms','?')}ms{OFF} {note}")
     for step in d.get("considered", []):
         print(f"      {DIM}· {step}{OFF}")
 
 
 def banner(title: str):
-    print(f"\n{'=' * 74}\n  {title}\n{'=' * 74}")
+    print(f"\n{'=' * 72}\n  {title}\n{'=' * 72}")
 
 
 # ---------------------------------------------------------------------------
 
 
-def scenario_identity(diversion: bool):
+def scenario_identity():
     banner("IDENTITY — can the router tell who is calling?")
     reset(wipe_history=True)
-    s = state()
-    print(f"  inbound_mode = {s['inbound_mode']}\n")
+    print(f"  inbound_mode = {state()['inbound_mode']}\n")
 
-    print("  Carrier PASSES the Diversion header (Airtel behaviour):")
-    d = call("919812345678", diversion=True)
-    line(d)
-    show_trail(d)
-    hangup(d["_call_uuid"])
+    print("  Carrier PASSES the Diversion header:")
+    d = call(CITIZEN, diversion=True); show(d); hangup(d["_uuid"])
 
-    print("\n  Carrier STRIPS the Diversion header (Jio/Vi behaviour):")
-    d = call("919812345678", diversion=False)
-    line(d)
-    show_trail(d)
-    hangup(d["_call_uuid"])
+    print("\n  Carrier STRIPS the Diversion header:")
+    d = call(CITIZEN, diversion=False); show(d); hangup(d["_uuid"])
 
-    print(f"\n  {Y}This is the SIM bottleneck, measured rather than argued:{OFF}")
-    print("  without ForwardedFrom every citizen presents as the same SIM number,")
-    print("  so repeat-caller routing cannot run at all. A direct DID removes the")
-    print("  dependency entirely (set INBOUND_MODE=direct_did).")
+    print(f"\n  {Y}Without ForwardedFrom every caller presents as the same number,{OFF}")
+    print("  so returning-caller routing cannot run at all.")
 
 
 def scenario_fill(total: int, diversion: bool):
     banner(f"CAPACITY — {total} concurrent calls against the thresholds")
     reset()
-    s = state()
-    cap = s["capacity"]
-    print(f"  policy={s['policy']}  ai={cap['ai']['cap']}  human={cap['human']['cap']}"
-          f"  (agents free {cap['human']['agents_free']})  queue={cap['queue']['cap']}\n")
-
-    if cap["human"]["agents_free"] == 0:
-        print(f"  {Y}No agents online — the human branch cannot be reached.{OFF}")
-        print(f"  {DIM}Register some: python sim.py agents --add 919812345678,919812345679{OFF}\n")
+    cap = state()["capacity"]
+    print(f"  policy={state()['policy']}  ai={cap['ai']['cap']}  "
+          f"human={cap['human']['cap']} ({cap['human']['agents_free']} agents free)  "
+          f"queue={cap['queue']['cap']}\n")
 
     seen: dict[str, int] = {}
     for i in range(total):
-        d = call(f"9198{i:08d}", diversion=diversion)
-        route = d.get("route", "?")
-        if route not in seen:
-            # Print the call where each branch first trips, and its reasoning.
-            seen[route] = i + 1
-            line(d, note=f"{DIM}<- first call routed here (#{i + 1}){OFF}")
-            show_trail(d)
+        d = call(f"9177777{i:05d}", diversion=diversion)
+        if d.get("route") not in seen:
+            seen[d["route"]] = i + 1
+            show(d, f"{DIM}<- first call here (#{i + 1}){OFF}")
 
     print()
     cap = state()["capacity"]
     for pool in ("ai", "human", "queue"):
-        p = cap[pool]
-        print(f"  {pool:<6} {p['in_use']:>3}/{p['cap']:<3} in use")
-    print(f"\n  first call to each branch: "
+        print(f"  {pool:<6} {cap[pool]['in_use']:>3}/{cap[pool]['cap']:<3} in use")
+    print("\n  first call to each branch:  "
           + "  ".join(f"{COLOUR.get(k,'')}{k}{OFF}=#{v}" for k, v in seen.items()))
 
 
 def scenario_repeat(diversion: bool):
-    banner("REPEAT CALLER — does the second call route differently?")
+    banner("RETURNING CALLER — does the second call route differently?")
     reset(wipe_history=True)
-    citizen = "919812345678"
 
-    print("  First call from this citizen:")
-    d1 = call(citizen, diversion=diversion)
-    line(d1)
-    show_trail(d1)
-
-    # the backend writes a reference back at the end of the conversation.
+    print("  First call:")
+    d1 = call(CITIZEN, diversion=diversion); show(d1)
     requests.post(f"{BASE}/reference",
-                  data={"number": citizen, "reference": "REF-2291",
-                        "summary": "Water supply disruption, ward 14"},
-                  timeout=5)
-    hangup(d1["_call_uuid"])
-    print(f"\n  {DIM}the backend posted reference REF-2291 back to /reference{OFF}")
+                  data={"number": CITIZEN, "reference": "REF-2291",
+                        "summary": "Unresolved query"}, timeout=5)
+    hangup(d1["_uuid"])
+    print(f"\n  {DIM}backend posted reference REF-2291 back to /reference{OFF}")
 
-    print("\n  Same citizen calls again:")
-    d2 = call(citizen, diversion=diversion)
-    line(d2)
-    show_trail(d2)
-    hangup(d2["_call_uuid"])
+    print("\n  Same caller again:")
+    d2 = call(CITIZEN, diversion=diversion); show(d2); hangup(d2["_uuid"])
 
     if d2.get("pool") == "ai_repeat":
-        print(f"\n  {G}Routed to the repeat-caller agent with the reference attached.{OFF}")
+        print(f"\n  {G}Routed to the returning-caller agent, reference attached.{OFF}")
     else:
-        print(f"\n  {Y}Not recognised as a repeat caller.{OFF}")
-        if not diversion:
-            print("  Expected: with no Diversion header there is nothing to key history on.")
+        print(f"\n  {Y}Not recognised — nothing to key history on.{OFF}")
 
 
 def scenario_queue(diversion: bool):
     banner("QUEUE — a caller held, then promoted when a channel frees")
     reset()
-    s = state()
-    ai_cap = s["capacity"]["ai"]["cap"]
-    human_cap = s["capacity"]["human"]["cap"]
-    agents_free = s["capacity"]["human"]["agents_free"]
-    to_fill = ai_cap + min(human_cap, agents_free)
-
-    print(f"  Filling every channel ({to_fill} calls)...")
-    live = [call(f"9199{i:08d}", diversion=diversion)["_call_uuid"] for i in range(to_fill)]
+    cap = state()["capacity"]
+    fill = cap["ai"]["cap"] + min(cap["human"]["cap"], cap["human"]["agents_free"])
+    print(f"  Filling every channel ({fill} calls)...")
+    live = [call(f"9166666{i:05d}", diversion=diversion)["_uuid"] for i in range(fill)]
 
     print("  One more caller arrives:")
-    d = call("917777700001", diversion=diversion)
-    line(d)
-    show_trail(d)
+    d = call(CITIZEN, diversion=diversion); show(d)
     if d.get("route") != "queue":
-        print(f"  {Y}Expected a queue here; check agent registration.{OFF}")
-        return
+        print(f"  {Y}Expected a queue here.{OFF}"); return
 
-    print(f"\n  {DIM}One AI call hangs up, freeing a channel...{OFF}")
+    print(f"\n  {DIM}One call hangs up, freeing a channel...{OFF}")
     hangup(live[0])
-
-    print("  The held caller's hold audio finishes and it comes back to /queue:")
-    # Deliberately sends only CallUUID and the SIM's From — no ForwardedFrom.
-    # The caller must still be recognised, from context cached at /answer.
-    r = requests.post(f"{BASE}/queue/{d['_call_uuid']}",
-                      data={"CallUUID": d["_call_uuid"], "From": "919999900001"},
-                      timeout=10)
-    latest = requests.get(f"{BASE}/decisions", params={"n": 1}, timeout=5).json()
-    d2 = (latest.get("decisions") or [{}])[0]
-    line(d2)
-    show_trail(d2)
-    print(f"\n  {DIM}XML returned:{OFF}")
-    for ln in r.text.strip().splitlines():
-        print(f"      {DIM}{ln}{OFF}")
-
-
-def scenario_escalate(diversion: bool):
-    banner("ESCALATION — AI to human mid-call (dry run)")
-    reset()
-    d = call("919812345678", diversion=diversion)
-    line(d, note="in progress with the AI")
-    print(f"\n  {DIM}POST /escalate {{\"call_uuid\": \"{d['_call_uuid']}\"}}{OFF}")
-    r = requests.post(f"{BASE}/escalate", data={"call_uuid": d["_call_uuid"]}, timeout=15)
-    try:
-        body = r.json()
-    except ValueError:
-        body = {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
-    if body.get("ok"):
-        print(f"  {G}Transfer issued to agent {body['agent']}{OFF}  "
-              f"(Vobiz {body.get('vobiz', {}).get('status')})")
-    else:
-        print(f"  {Y}{body.get('error')}{OFF}")
-        print(f"  {DIM}A real CallUUID and Vobiz credentials are needed for the "
-              f"transfer itself; the pool move and XML are exercised regardless.{OFF}")
-    xml = requests.get(f"{BASE}/transfer-target", params={"agent": "919812345678"},
-                       timeout=5).text
-    print(f"\n  {DIM}XML the transferred leg would execute:{OFF}")
-    for ln in xml.strip().splitlines():
-        print(f"      {DIM}{ln}{OFF}")
-
-
-def cmd_agents(add: str):
-    for number in [n.strip() for n in add.split(",") if n.strip()]:
-        requests.post(f"{BASE}/agents",
-                      data={"number": number, "register": "true", "online": "true",
-                            "busy": "false"},
-                      timeout=5)
-    print(requests.get(f"{BASE}/agents", timeout=5).json())
+    print("  The hold audio finishes and the caller returns to /queue:")
+    requests.post(f"{BASE}/queue/{d['_uuid']}", data={"CallUUID": d["_uuid"]}, timeout=10)
+    show(requests.get(f"{BASE}/decisions", params={"n": 1}, timeout=5).json()["decisions"][0])
 
 
 def main():
     global BASE
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("scenario",
-                    choices=["identity", "fill", "repeat", "queue", "escalate-dry",
-                             "agents", "all"])
+    ap.add_argument("scenario", choices=["identity", "fill", "repeat", "queue", "all"])
     ap.add_argument("--base", default=BASE)
     ap.add_argument("--calls", type=int, default=95)
     ap.add_argument("--no-diversion", action="store_true",
                     help="simulate a carrier that strips the SIP Diversion header")
-    ap.add_argument("--add", default="", help="agents to register, comma separated")
     args = ap.parse_args()
 
     BASE = args.base.rstrip("/")
-    diversion = not args.no_diversion
+    div = not args.no_diversion
     state()  # fail fast with a clear message if the router is not running
 
-    if args.scenario == "agents":
-        return cmd_agents(args.add)
     if args.scenario in ("identity", "all"):
-        scenario_identity(diversion)
+        scenario_identity()
     if args.scenario in ("fill", "all"):
-        scenario_fill(args.calls, diversion)
+        scenario_fill(args.calls, div)
     if args.scenario in ("repeat", "all"):
-        scenario_repeat(diversion)
+        scenario_repeat(div)
     if args.scenario in ("queue", "all"):
-        scenario_queue(diversion)
-    if args.scenario in ("escalate-dry", "all"):
-        scenario_escalate(diversion)
+        scenario_queue(div)
     print()
 
 
